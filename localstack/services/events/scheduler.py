@@ -90,7 +90,7 @@ class Job:
         else:
             raise ValueError(f"unexpected return type {type(schedule)}")
 
-        scheduler.add(self.task)
+        scheduler.schedule_task(self.task)
 
     def on_execute_error(self, exception: Exception):
         LOG.error("Error executing job %s", self.job_id, exc_info=exception)
