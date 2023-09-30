@@ -37,7 +37,7 @@ from localstack.aws.api.events import (
 )
 from localstack.constants import APPLICATION_AMZ_JSON_1_1
 from localstack.services.events.models import EventsStore, events_stores
-from localstack.services.events.scheduler import JobScheduler
+from localstack.services.events.scheduler import JobScheduler, parse_schedule_expression
 from localstack.services.moto import call_moto
 from localstack.services.plugins import ServiceLifecycleHook
 from localstack.utils.aws.arns import event_bus_arn
@@ -67,12 +67,13 @@ class ValidationException(ServiceException):
 class EventsProvider(EventsApi, ServiceLifecycleHook):
     def __init__(self):
         apply_patches()
+        self.job_scheduler = JobScheduler()
 
     def on_before_start(self):
-        JobScheduler.start()
+        self.job_scheduler.start()
 
     def on_before_stop(self):
-        JobScheduler.shutdown()
+        self.job_scheduler.shutdown()
 
     @staticmethod
     def get_store(context: RequestContext) -> EventsStore:
@@ -140,38 +141,8 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
 
         return func
 
-    @staticmethod
-    def convert_schedule_to_cron(schedule):
-        """Convert Events schedule like "cron(0 20 * * ? *)" or "rate(5 minutes)" """
-        cron_regex = r"\s*cron\s*\(([^\)]*)\)\s*"
-        if re.match(cron_regex, schedule):
-            cron = re.sub(cron_regex, r"\1", schedule)
-            return cron
-        rate_regex = r"\s*rate\s*\(([^\)]*)\)\s*"
-        if re.match(rate_regex, schedule):
-            rate = re.sub(rate_regex, r"\1", schedule)
-            value, unit = re.split(r"\s+", rate.strip())
-
-            value = int(value)
-            if value < 1:
-                raise ValueError("Rate value must be larger than 0")
-            # see https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-rate-expressions.html
-            if value == 1 and unit.endswith("s"):
-                raise ValueError("If the value is equal to 1, then the unit must be singular")
-            if value > 1 and not unit.endswith("s"):
-                raise ValueError("If the value is greater than 1, the unit must be plural")
-
-            if "minute" in unit:
-                return "*/%s * * * *" % value
-            if "hour" in unit:
-                return "0 */%s * * *" % value
-            if "day" in unit:
-                return "0 0 */%s * *" % value
-            raise ValueError("Unable to parse events schedule expression: %s" % schedule)
-        return schedule
-
-    @staticmethod
     def put_rule_job_scheduler(
+        self,
         store: EventsStore,
         name: Optional[RuleName],
         state: Optional[RuleState],
@@ -180,9 +151,9 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
     ):
         if not schedule_expression:
             return
-
         try:
-            cron = EventsProvider.convert_schedule_to_cron(schedule_expression)
+            # guard against invalid expressions
+            parse_schedule_expression(schedule_expression)
         except ValueError as e:
             LOG.error("Error parsing schedule expression: %s", e)
             raise ValidationException("Parameter ScheduleExpression is not valid.") from e
@@ -190,10 +161,9 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
         job_func = EventsProvider.get_scheduled_rule_func(
             store, name, event_bus_name_or_arn=event_bus_name_or_arn
         )
-        LOG.debug("Adding new scheduled Events rule with cron schedule %s", cron)
 
         enabled = state != "DISABLED"
-        job_id = JobScheduler.instance().add_job(job_func, cron, enabled)
+        job_id = self.job_scheduler.add_job(job_func, schedule_expression, enabled)
         rule_scheduled_jobs = store.rule_scheduled_jobs
         rule_scheduled_jobs[name] = job_id
 
@@ -225,8 +195,8 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
         rule_scheduled_jobs = self.get_store(context).rule_scheduled_jobs
         job_id = rule_scheduled_jobs.get(name)
         if job_id:
-            LOG.debug("Removing scheduled Events: {} | job_id: {}".format(name, job_id))
-            JobScheduler.instance().cancel_job(job_id=job_id)
+            LOG.debug("Removing rule: %s (job_id: %s)", name, job_id)
+            self.job_scheduler.cancel_job(job_id=job_id)
         call_moto(context)
 
     def disable_rule(
@@ -235,8 +205,18 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
         rule_scheduled_jobs = self.get_store(context).rule_scheduled_jobs
         job_id = rule_scheduled_jobs.get(name)
         if job_id:
-            LOG.debug("Disabling Rule: {} | job_id: {}".format(name, job_id))
-            JobScheduler.instance().disable_job(job_id=job_id)
+            LOG.debug("Disabling rule %s (job_id: %s)", name, job_id)
+            self.job_scheduler.disable_job(job_id=job_id)
+        call_moto(context)
+
+    def enable_rule(
+        self, context: RequestContext, name: RuleName, event_bus_name: EventBusNameOrArn = None
+    ) -> None:
+        rule_scheduled_jobs = self.get_store(context).rule_scheduled_jobs
+        job_id = rule_scheduled_jobs.get(name)
+        if job_id:
+            LOG.debug("Enabling rule %s (job_id: %s)", name, job_id)
+            self.job_scheduler.enable_job(job_id=job_id)
         call_moto(context)
 
     def create_connection(

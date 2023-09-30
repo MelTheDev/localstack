@@ -148,6 +148,12 @@ class Scheduler:
             self._queue.put((task.deadline, task))
             self._condition.notify()
 
+    def cancel(self, task: ScheduledTask) -> None:
+        task._cancelled = True
+
+        with self._condition:
+            self._condition.notify()
+
     def close(self) -> None:
         """
         Terminates the run loop.
