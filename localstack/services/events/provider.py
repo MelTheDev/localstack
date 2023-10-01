@@ -35,6 +35,7 @@ from localstack.aws.api.events import (
     TestEventPatternResponse,
 )
 from localstack.constants import APPLICATION_AMZ_JSON_1_1
+from localstack.services.events.dispatcher import EventDispatchContext, EventDispatcher
 from localstack.services.events.models import EventsStore, events_stores
 from localstack.services.events.scheduler import JobId, JobScheduler, parse_schedule_expression
 from localstack.services.moto import call_moto
@@ -235,7 +236,7 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
             LOG.error("Error parsing schedule expression %s: %s", schedule_expression, e)
             raise ValidationException("Parameter ScheduleExpression is not valid.") from e
 
-        dispatcher = RuleEventDispatcher(
+        dispatcher = ScheduledRuleDispatcher(
             region, account_id, get_event_bus_name(event_bus_name_or_arn), rule_name
         )
 
@@ -244,7 +245,7 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
         return job_id
 
 
-class RuleEventDispatcher:
+class ScheduledRuleDispatcher:
     """
     Callable used as a Job function for a Rule that was scheduled using a schedule expression.
     """
@@ -276,29 +277,26 @@ class RuleEventDispatcher:
             return
 
         for target in rule.targets:
-            arn = target.get("Arn")
-            LOG.debug("Event rule %s sending event to target %s", rule.name, arn)
+            target_arn = target.get("Arn")
 
-            # TODO generate event matching aws in case no Input has been specified
-            event_str = target.get("Input") or "{}"
-            event = json.loads(event_str)
-            attr = pick_attributes(target, ["$.SqsParameters", "$.KinesisParameters"])
+            context = EventDispatchContext(
+                source_service="aws.events",
+                detail_type="Scheduled Event",
+                source_arn=rule.arn,
+                account_id=self.account_id,
+                region=self.region,
+                target=target,
+            )
 
+            # TODO: RetryPolicy
+            dispatcher = EventDispatcher.dispatcher_for_target(target_arn)
             try:
-                send_event_to_target(
-                    arn,
-                    event,
-                    target_attributes=attr,
-                    role=target.get("RoleArn"),
-                    target=target,
-                    source_arn=rule.arn,
-                    source_service=ServicePrincipal.events,
-                )
+                dispatcher.dispatch(context)
             except Exception as e:
                 LOG.error(
-                    "Unable to send event notification %s to target %s: %s",
-                    truncate(event),
-                    target,
+                    "Failed to dispatch event notification rule %s to %s: %s",
+                    rule.name,
+                    context.target,
                     e,
                     exc_info=e if LOG.isEnabledFor(logging.DEBUG) else None,
                 )
@@ -563,6 +561,7 @@ def get_event_bus_name(event_bus_name_or_arn: Optional[EventBusNameOrArn] = None
 
 # specific logic for put_events which forwards matching events to target listeners
 def events_handler_put_events(self):
+    # TODO: replace with EventDispatcher
     entries = self._get_param("Entries")
 
     # keep track of events for local integration testing

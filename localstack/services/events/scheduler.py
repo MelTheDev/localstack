@@ -137,6 +137,9 @@ class JobScheduler:
             except KeyError:
                 raise ValueError(f"No job with id {job_id}")
 
+    def get_job(self, job_id: JobId) -> Job | None:
+        return self.jobs.get(job_id)
+
     def shutdown(self):
         self.scheduler.close()
         self.executor.shutdown(cancel_futures=True)

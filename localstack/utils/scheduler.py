@@ -153,6 +153,10 @@ class Scheduler:
     def cancel(self, task: ScheduledTask) -> None:
         task._cancelled = True
 
+    def notify(self):
+        """
+        Notify the run loop that something in the schedule has happened.
+        """
         with self._condition:
             self._condition.notify()
 
