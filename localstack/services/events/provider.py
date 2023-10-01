@@ -8,6 +8,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 from moto.events.responses import EventsHandler as MotoEventsHandler
+from werkzeug import Request
+from werkzeug.exceptions import NotFound
 
 from localstack import config
 from localstack.aws.api import RequestContext
@@ -35,12 +37,14 @@ from localstack.aws.api.events import (
     TestEventPatternResponse,
 )
 from localstack.constants import APPLICATION_AMZ_JSON_1_1
+from localstack.http import route
+from localstack.services.edge import ROUTER
 from localstack.services.events.dispatcher import EventDispatchContext, EventDispatcher
 from localstack.services.events.models import EventsStore, events_stores
 from localstack.services.events.scheduler import JobId, JobScheduler, parse_schedule_expression
 from localstack.services.moto import call_moto
 from localstack.services.plugins import ServiceLifecycleHook
-from localstack.utils.aws.arns import event_bus_arn
+from localstack.utils.aws.arns import event_bus_arn, parse_arn
 from localstack.utils.aws.client_types import ServicePrincipal
 from localstack.utils.aws.message_forwarding import send_event_to_target
 from localstack.utils.collections import pick_attributes
@@ -69,11 +73,34 @@ class EventsProvider(EventsApi, ServiceLifecycleHook):
         apply_patches()
         self.job_scheduler = JobScheduler()
 
+    def on_after_init(self):
+        ROUTER.add(self.trigger_scheduled_rule)
+
     def on_before_start(self):
         self.job_scheduler.start()
 
     def on_before_stop(self):
         self.job_scheduler.shutdown()
+
+    @route("/_aws/events/<path:rule_arn>/trigger")
+    def trigger_scheduled_rule(self, request: Request, rule_arn: str):
+        """Developer endpoint to trigger a scheduled rule."""
+        arn_data = parse_arn(rule_arn)
+        account_id = arn_data["account"]
+        region = arn_data["region"]
+        rule_name = arn_data["resource"].split("/", maxsplit=1)[-1]
+
+        job_id = events_stores[account_id][region].rule_scheduled_jobs.get(rule_name)
+        if not job_id:
+            raise NotFound()
+        job = self.job_scheduler.get_job(job_id)
+        if not job:
+            raise NotFound()
+
+        # update the task deadline to run ASAP and notify the scheduler. the deadline will be set to the
+        # normal schedule by the scheduler after it runs.
+        job.task.deadline = 0
+        self.job_scheduler.scheduler.notify()
 
     @staticmethod
     def get_store(context: RequestContext) -> EventsStore:
